@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mark Attendance</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        #camera-feed { width: 100%; max-width: 400px; border-radius: 10px; background: #000; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body class="bg-light text-center">
+
+<div class="container mt-4">
+    <h3 class="mb-3">📸 Student Attendance</h3>
+    
+    <div id="status-msg" class="alert alert-info">Looking for active class...</div>
+
+    <div class="d-flex justify-content-center mb-3">
+        <video id="camera-feed" autoplay playsinline></video>
+        <canvas id="snapshot-canvas" class="hidden"></canvas>
+    </div>
+
+    <div class="d-grid gap-2 col-md-6 mx-auto">
+        <button id="btn-mark" class="btn btn-primary btn-lg" disabled>
+            Mark Attendance
+        </button>
+    </div>
+
+    <p class="mt-3 text-muted small">
+        <span id="location-status">📍 Waiting for GPS...</span>
+    </p>
+</div>
+
+<script>
+    const video = document.getElementById('camera-feed');
+    const canvas = document.getElementById('snapshot-canvas');
+    const btnMark = document.getElementById('btn-mark');
+    const statusMsg = document.getElementById('status-msg');
+    const locStatus = document.getElementById('location-status');
+    
+    let currentLat = null;
+    let currentLong = null;
+    let activeSessionId = null;
+
+    // 1. Start Camera
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } })
+        .then(stream => { video.srcObject = stream; })
+        .catch(err => { alert("Camera Error: " + err); });
+
+    // 2. Start GPS
+    if (navigator.geolocation) {
+        navigator.geolocation.watchPosition(
+            (position) => {
+                currentLat = position.coords.latitude;
+                currentLong = position.coords.longitude;
+                locStatus.innerText = `📍 GPS Active: ${currentLat.toFixed(4)}, ${currentLong.toFixed(4)}`;
+                checkActiveSession(); // Try to enable button if GPS is ready
+            },
+            (err) => { locStatus.innerText = "❌ GPS Permission Denied"; }
+        );
+    } else {
+        locStatus.innerText = "❌ GPS not supported";
+    }
+
+    // 3. Check for Active Session (Simple Polling)
+    // For this demo, we assume Session ID 1 is active. 
+    // In a real app, we fetch this from the server.
+    function checkActiveSession() {
+        if(currentLat) {
+            btnMark.disabled = false;
+            statusMsg.innerText = "Ready to mark attendance!";
+            statusMsg.className = "alert alert-success";
+            // Hardcoding Session ID for test. You can make this dynamic later.
+            activeSessionId = "{{ session_id|default:'1' }}"; 
+        }
+    }
+
+    // 4. Handle Button Click
+    btnMark.addEventListener('click', () => {
+        // A. Capture Image
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        
+        canvas.toBlob((blob) => {
+            // B. Prepare Data
+            const formData = new FormData();
+            formData.append('session', activeSessionId);
+            formData.append('captured_image', blob, 'attendance.jpg');
+            formData.append('gps_lat', currentLat);
+            formData.append('gps_long', currentLong);
+
+            // C. Send to API
+            btnMark.innerText = "Sending...";
+            btnMark.disabled = true;
+
+            fetch('/api/mark-attendance/', {
+                method: 'POST',
+                headers: {
+                    'X-CSRFToken': '{{ csrf_token }}' // Django security token
+                },
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if(data.message) {
+                    alert("✅ Success: " + data.message);
+                    window.location.reload();
+                } else {
+                    alert("❌ Error: " + (data.error || JSON.stringify(data)));
+                    btnMark.innerText = "Try Again";
+                    btnMark.disabled = false;
+                }
+            })
+            .catch(err => {
+                alert("Server Error: " + err);
+                btnMark.disabled = false;
+            });
+        }, 'image/jpeg');
+    });
+</script>
+
+</body>
+</html>
