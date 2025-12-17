@@ -11,8 +11,6 @@ from django.contrib.auth.forms import AuthenticationForm
 from django.shortcuts import render, redirect
 from .models import User
 from django.db.models import Count
-import base64
-from django.core.files.base import ContentFile
 class HomeView(APIView):
     def get(self, request):
         # Fetch counts for the graphs
@@ -40,93 +38,55 @@ class MarkAttendanceView(APIView):
         if serializer.is_valid():
             student = request.user
             session_id = request.data.get('session')
-
-            # 0. BASIC VALIDATION (Before saving anything)
-            if not student.profile_image:
-                 return Response({"error": "You don't have a profile photo set!"}, status=400)
             
+            # 1. TIME CHECK (1-Hour Cooldown)
+            last_record = AttendanceRecord.objects.filter(student=student).order_by('-timestamp').first()
+            if last_record:
+                time_since_last = timezone.now() - last_record.timestamp
+                if time_since_last < timedelta(hours=1):
+                    wait_time = 60 - int(time_since_last.total_seconds() / 60)
+                    return Response(
+                        {"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, 
+                        status=400
+                    )
+            
+            # 2. SESSION & LOCATION CHECKS
             try:
                 session = AttendanceSession.objects.get(id=session_id)
             except AttendanceSession.DoesNotExist:
                 return Response({"error": "Session ID does not exist"}, status=400)
 
-            # ---------------------------------------------------------
-            # 1. SAVE RECORD TEMPORARILY
-            # (We must save it to disk first so the AI library can read the file path)
-            # ---------------------------------------------------------
-            record = serializer.save(student=student)
-
-            # ---------------------------------------------------------
-            # 2. PRIORITY CHECK: FACE RECOGNITION 👁️
-            # ---------------------------------------------------------
-            print("🤖 Starting AI Face Check...")
-            is_match = check_face_match(student.reference_image.path, record.captured_image.path)
-            
-            if not is_match:
-                record.delete() # ❌ Delete the record immediately
-                return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
-
-            # ---------------------------------------------------------
-            # 3. SECOND CHECK: CLASS DURATION ⏳
-            # ---------------------------------------------------------
             if not session.is_active:
-                record.delete() # ❌ Delete logic
-                return Response({"error": "Time is up! Class has ended."}, status=400)
-
-            # ---------------------------------------------------------
-            # 4. THIRD CHECK: 1-HOUR COOLDOWN 🕐
-            # ---------------------------------------------------------
-            # We verify the *previous* record (excluding the one we just saved)
-            last_record = AttendanceRecord.objects.filter(student=student).exclude(id=record.id).order_by('-timestamp').first()
+                return Response({"error": "Time is up!"}, status=400)
             
-            if last_record:
-                time_since_last = timezone.now() - last_record.timestamp
-                if time_since_last < timedelta(hours=1):
-                    wait_time = 60 - int(time_since_last.total_seconds() / 60)
-                    record.delete() # ❌ Delete logic
-                    return Response(
-                        {"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, 
-                        status=400
-                    )
-
-            # ---------------------------------------------------------
-            # 5. FINAL CHECK: LOCATION (GPS) 📍
-            # ---------------------------------------------------------
+            # Check Location
             student_loc = (float(request.data.get('gps_lat')), float(request.data.get('gps_long')))
             college_loc = (session.latitude, session.longitude)
-            # ... inside post method ...
-
-            # ---------------------------------------------------------
-            # 4. FACE CHECK LOGIC (Updated)
-            # ---------------------------------------------------------
             
-            # --- SAFETY CHECK STARTS HERE ---
-            # If the user has no Security Scan, stop immediately.
-            if not student.reference_image:
-                 record.delete()
-                 return Response({
-                     "error": "Security Scan missing! This account is old. Please Register a NEW account with the Live Scan."
-                 }, status=400)
-            # --- SAFETY CHECK ENDS HERE ---
-
-            print("🤖 Starting AI Face Check against LIVE REFERENCE...")
-            
-            # Now it is safe to access .path because we know it exists
-            is_match = check_face_match(student.reference_image.path, record.captured_image.path)
-            
-            if not is_match:
-                record.delete()
-                return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
             if not is_within_radius(student_loc, college_loc, session.radius_meters):
-                 record.delete() # ❌ Delete logic
                  return Response({"error": "You are outside the class radius!"}, status=400)
 
+            # 3. SAVE RECORD (Temporarily)
+            record = serializer.save(student=student)
+            
             # ---------------------------------------------------------
-            # 6. SUCCESS: FINALIZE RECORD ✅
+            # 4. FACE CHECK LOGIC (This was missing!)
             # ---------------------------------------------------------
-            record.status = "PRESENT"
-            record.save()
+            if not student.profile_image:
+                 record.delete() # Clean up
+                 return Response({"error": "You don't have a profile photo set!"}, status=400)
 
+            print("🤖 Starting AI Face Check...")
+            is_match = check_face_match(student.profile_image.path, record.captured_image.path)
+            
+            if not is_match:
+                # If face doesn't match, MARK AS REJECTED (or delete)
+                record.status = "REJECTED"
+                record.save()
+                return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
+            # ---------------------------------------------------------
+
+            # 5. SUCCESS (Only reachable if face matches)
             return Response({
                 "message": "Attendance Marked!",
                 "class_name": session.course.name,
@@ -135,6 +95,7 @@ class MarkAttendanceView(APIView):
             }, status=201)
 
         return Response(serializer.errors, status=400)
+
 
 
 # core/views.py
@@ -235,42 +196,33 @@ class StudentPortalView(LoginRequiredMixin, TemplateView):
 
 def signup_view(request):
     if request.method == 'POST':
+        # Get data from the HTML form
         username = request.POST.get('username')
         password = request.POST.get('password')
         role = request.POST.get('role')
-        
-        # 1. Get the Files
-        photo_file = request.FILES.get('profile_image')       # The Uploaded File
-        live_image_data = request.POST.get('live_image_data') # The Live Capture Base64
-
-        if not photo_file or not live_image_data:
-             return render(request, 'core/signup.html', {'error': "Both Profile Photo and Live Scan are required!"})
+        photo = request.FILES.get('profile_image') # Crucial for Face Rec
 
         try:
+            # Create the user using Django's secure helper
             user = User.objects.create_user(username=username, password=password)
             user.role = role
-            
-            # A. Save Display Photo
-            user.profile_image = photo_file
-            
-            # B. Save Security Reference (Convert Base64)
-            format, imgstr = live_image_data.split(';base64,') 
-            ext = format.split('/')[-1]
-            file_data = ContentFile(base64.b64decode(imgstr), name=f'{username}_security_ref.{ext}')
-            
-            user.reference_image = file_data # <--- SAVED TO NEW FIELD
-
+            if photo:
+                user.profile_image = photo
             user.save()
+
+            # Log them in immediately
             login(request, user)
             
+            # Redirect based on role
             if role == 'STUDENT':
                 return redirect('student_portal')
-            return redirect('faculty_dashboard')
+            return redirect('dashboard')
             
         except Exception as e:
             return render(request, 'core/signup.html', {'error': str(e)})
 
     return render(request, 'core/signup.html')
+
 def login_view(request):
     if request.method == 'POST':
         form = AuthenticationForm(request, data=request.POST)
