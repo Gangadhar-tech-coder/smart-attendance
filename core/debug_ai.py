@@ -26,6 +26,7 @@ print("Comparing...")
 distance = face_recognition.face_distance([enc_a], enc_b)[0]
 print(f"📉 Face Distance: {distance}")
 
+
 # 4. Result
 if distance < 0.5:
     print("❌ RESULT: MATCH (System thinks they are the same person)")

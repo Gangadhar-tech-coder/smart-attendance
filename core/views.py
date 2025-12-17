@@ -34,107 +34,83 @@ from datetime import timedelta
 from django.utils import timezone
 from .utils import check_face_match, is_within_radius # Ensure this is imported
 
+# core/views.py
+
 class MarkAttendanceView(APIView):
     def post(self, request):
-        serializer = AttendanceSerializer(data=request.data)
-        if serializer.is_valid():
-            student = request.user
-            session_id = request.data.get('session')
+        # 1. Get Data Manually (Since we aren't using serializer to save yet)
+        session_id = request.data.get('session')
+        gps_lat = float(request.data.get('gps_lat'))
+        gps_long = float(request.data.get('gps_long'))
+        live_image = request.FILES.get('captured_image') # The file in RAM
+        student = request.user
 
-            # 0. BASIC VALIDATION (Before saving anything)
-            if not student.profile_image:
-                 return Response({"error": "You don't have a profile photo set!"}, status=400)
-            
-            try:
-                session = AttendanceSession.objects.get(id=session_id)
-            except AttendanceSession.DoesNotExist:
-                return Response({"error": "Session ID does not exist"}, status=400)
+        # 0. BASIC CHECKS
+        if not live_image:
+            return Response({"error": "No image uploaded!"}, status=400)
+        
+        if not student.reference_image:
+             return Response({"error": "Security Scan missing! Please re-register."}, status=400)
 
-            # ---------------------------------------------------------
-            # 1. SAVE RECORD TEMPORARILY
-            # (We must save it to disk first so the AI library can read the file path)
-            # ---------------------------------------------------------
-            record = serializer.save(student=student)
+        try:
+            session = AttendanceSession.objects.get(id=session_id)
+        except AttendanceSession.DoesNotExist:
+            return Response({"error": "Session ID invalid"}, status=400)
 
-            # ---------------------------------------------------------
-            # 2. PRIORITY CHECK: FACE RECOGNITION 👁️
-            # ---------------------------------------------------------
-            print("🤖 Starting AI Face Check...")
-            is_match = check_face_match(student.reference_image.path, record.captured_image.path)
-            
-            if not is_match:
-                record.delete() # ❌ Delete the record immediately
-                return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
+        # ---------------------------------------------------------
+        # 1. PRIORITY CHECK: FACE RECOGNITION (In Memory) 👁️
+        # ---------------------------------------------------------
+        print("🤖 Verifying Face in Memory (No Save)...")
+        
+        # We pass the 'live_image' file object directly to utils
+        is_match = check_face_match(student.reference_image.path, live_image)
+        
+        if not is_match:
+            return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
 
-            # ---------------------------------------------------------
-            # 3. SECOND CHECK: CLASS DURATION ⏳
-            # ---------------------------------------------------------
-            if not session.is_active:
-                record.delete() # ❌ Delete logic
-                return Response({"error": "Time is up! Class has ended."}, status=400)
+        # ---------------------------------------------------------
+        # 2. DURATION CHECK ⏳
+        # ---------------------------------------------------------
+        if not session.is_active:
+            return Response({"error": "Time is up! Class has ended."}, status=400)
 
-            # ---------------------------------------------------------
-            # 4. THIRD CHECK: 1-HOUR COOLDOWN 🕐
-            # ---------------------------------------------------------
-            # We verify the *previous* record (excluding the one we just saved)
-            last_record = AttendanceRecord.objects.filter(student=student).exclude(id=record.id).order_by('-timestamp').first()
-            
-            if last_record:
-                time_since_last = timezone.now() - last_record.timestamp
-                if time_since_last < timedelta(hours=1):
-                    wait_time = 60 - int(time_since_last.total_seconds() / 60)
-                    record.delete() # ❌ Delete logic
-                    return Response(
-                        {"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, 
-                        status=400
-                    )
+        # ---------------------------------------------------------
+        # 3. 1-HOUR COOLDOWN CHECK 🕐
+        # ---------------------------------------------------------
+        last_record = AttendanceRecord.objects.filter(student=student).order_by('-timestamp').first()
+        if last_record:
+            time_since_last = timezone.now() - last_record.timestamp
+            if time_since_last < timedelta(hours=1):
+                wait_time = 60 - int(time_since_last.total_seconds() / 60)
+                return Response({"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, status=400)
 
-            # ---------------------------------------------------------
-            # 5. FINAL CHECK: LOCATION (GPS) 📍
-            # ---------------------------------------------------------
-            student_loc = (float(request.data.get('gps_lat')), float(request.data.get('gps_long')))
-            college_loc = (session.latitude, session.longitude)
-            # ... inside post method ...
+        # ---------------------------------------------------------
+        # 4. LOCATION CHECK 📍
+        # ---------------------------------------------------------
+        student_loc = (gps_lat, gps_long)
+        college_loc = (session.latitude, session.longitude)
+        
+        if not is_within_radius(student_loc, college_loc, session.radius_meters):
+             return Response({"error": "You are outside the class radius!"}, status=400)
 
-            # ---------------------------------------------------------
-            # 4. FACE CHECK LOGIC (Updated)
-            # ---------------------------------------------------------
-            
-            # --- SAFETY CHECK STARTS HERE ---
-            # If the user has no Security Scan, stop immediately.
-            if not student.reference_image:
-                 record.delete()
-                 return Response({
-                     "error": "Security Scan missing! This account is old. Please Register a NEW account with the Live Scan."
-                 }, status=400)
-            # --- SAFETY CHECK ENDS HERE ---
+        # ---------------------------------------------------------
+        # 5. SUCCESS: CREATE RECORD (Without Image) ✅
+        # ---------------------------------------------------------
+        AttendanceRecord.objects.create(
+            session=session,
+            student=student,
+            gps_lat=gps_lat,
+            gps_long=gps_long,
+            status="PRESENT",
+            captured_image=None  # Explicitly saving NO image
+        )
 
-            print("🤖 Starting AI Face Check against LIVE REFERENCE...")
-            
-            # Now it is safe to access .path because we know it exists
-            is_match = check_face_match(student.reference_image.path, record.captured_image.path)
-            
-            if not is_match:
-                record.delete()
-                return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
-            if not is_within_radius(student_loc, college_loc, session.radius_meters):
-                 record.delete() # ❌ Delete logic
-                 return Response({"error": "You are outside the class radius!"}, status=400)
-
-            # ---------------------------------------------------------
-            # 6. SUCCESS: FINALIZE RECORD ✅
-            # ---------------------------------------------------------
-            record.status = "PRESENT"
-            record.save()
-
-            return Response({
-                "message": "Attendance Marked!",
-                "class_name": session.course.name,
-                "faculty_name": session.course.faculty.username,
-                "topic": session.topic
-            }, status=201)
-
-        return Response(serializer.errors, status=400)
+        return Response({
+            "message": "Attendance Marked!",
+            "class_name": session.course.name,
+            "faculty_name": session.course.faculty.username,
+            "topic": session.topic
+        }, status=201)
 
 
 # core/views.py

@@ -1,42 +1,38 @@
+# core/utils.py
 import face_recognition
 from geopy.distance import geodesic
 
+# Location check remains same...
 def is_within_radius(student_loc, college_loc, radius_meters):
     distance = geodesic(student_loc, college_loc).meters
-    print(f"📍 GPS Debug: Dist={distance}m (Allowed={radius_meters}m)")
     return distance <= radius_meters
 
-def check_face_match(profile_image_path, captured_image_path):
-    print(f"🤖 AI Debug: Comparing images...")
-    print(f"   - Profile: {profile_image_path}")
-    print(f"   - Capture: {captured_image_path}")
-
+# UPDATED FACE CHECKER
+def check_face_match(reference_image_path, captured_image_file):
     try:
-        # Load Profile
-        known_image = face_recognition.load_image_file(profile_image_path)
+        # 1. Load Reference (From Disk - The Saved Scan)
+        known_image = face_recognition.load_image_file(reference_image_path)
         known_encodings = face_recognition.face_encodings(known_image)
+        
         if len(known_encodings) == 0:
-            print("❌ AI Fail: No face in Profile Image")
-            return False # STRICT FAIL
+            return False 
+        
+        known_encoding = known_encodings[0]
 
-        # Load Capture
-        unknown_image = face_recognition.load_image_file(captured_image_path)
+        # 2. Load Captured (From Memory - The Live Upload)
+        # We can pass the file object directly!
+        unknown_image = face_recognition.load_image_file(captured_image_file)
         unknown_encodings = face_recognition.face_encodings(unknown_image)
+
         if len(unknown_encodings) == 0:
-            print("❌ AI Fail: No face in Captured Selfie")
-            return False # STRICT FAIL
-
-        # Compare
-        distance = face_recognition.face_distance([known_encodings[0]], unknown_encodings[0])[0]
-        print(f"📉 AI Debug: Similarity Score = {distance} (Threshold 0.5)")
-
-        if distance < 0.5:
-            print("✅ AI Result: MATCH")
-            return True
-        else:
-            print("⛔ AI Result: MISMATCH")
             return False
 
+        # 3. Compare
+        distance = face_recognition.face_distance([known_encoding], unknown_encodings[0])[0]
+        
+        # 0.5 is the strictness threshold
+        return distance < 0.5
+
     except Exception as e:
-        print(f"❌ CRITICAL AI ERROR: {e}")
-        return False # Fail on any error
+        print(f"❌ AI Error: {e}")
+        return False

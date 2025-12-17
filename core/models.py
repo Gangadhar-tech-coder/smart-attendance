@@ -50,7 +50,7 @@ class AttendanceRecord(models.Model):
     session = models.ForeignKey(AttendanceSession, on_delete=models.CASCADE)
     student = models.ForeignKey(User, on_delete=models.CASCADE, limit_choices_to={'role': 'STUDENT'})
     timestamp = models.DateTimeField(auto_now_add=True)
-    captured_image = models.ImageField(upload_to='attendance_captures/')
+    captured_image = models.ImageField(upload_to='attendance_captures/', null=True, blank=True)
     gps_lat = models.FloatField()
     gps_long = models.FloatField()
     status = models.CharField(max_length=20, default='PRESENT')
