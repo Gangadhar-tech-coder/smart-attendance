@@ -247,27 +247,43 @@ def signup_view(request):
             return render(request, 'core/signup.html', {'error': str(e)})
 
     return render(request, 'core/signup.html')
+# core/views.py
+
 def login_view(request):
     if request.method == 'POST':
-        form = AuthenticationForm(request, data=request.POST)
-        if form.is_valid():
-            user = form.get_user()
+        # 1. Get Data from Form
+        u_name = request.POST.get('username')
+        pass_word = request.POST.get('password')
+        selected_role = request.POST.get('role') # <--- Get the dropdown value
+
+        # 2. Standard Django Authentication
+        user = authenticate(username=u_name, password=pass_word)
+
+        if user is not None:
+            # 3. CUSTOM CONDITION: Check Role Match
+            # We compare the role in Database (user.role) vs Dropdown (selected_role)
+            if user.role != selected_role:
+                # Mismatch! Deny access.
+                return render(request, 'core/login.html', {
+                    'error': f"Access Denied: You are not registered as a {selected_role.capitalize()}."
+                })
+
+            # 4. Success - Log them in
             login(request, user)
-            
-            # --- THE CONSTRAINT LOGIC ---
+
+            # 5. Redirect based on role
             if user.role == 'STUDENT':
                 return redirect('student_portal')
             elif user.role == 'FACULTY':
                 return redirect('faculty_dashboard')
-            elif user.role == 'ADMIN' or user.is_superuser:
-                return redirect('/admin/') # Send Admins to Django Admin Panel
-            else:
-                return redirect('home') # Fallback
-            # ---------------------------
-    else:
-        form = AuthenticationForm()
-    
-    return render(request, 'core/login.html', {'form': form})
+            elif user.role == 'ADMIN':
+                return redirect('/admin/')
+            
+        else:
+            # Authentication failed (Wrong Username/Password)
+            return render(request, 'core/login.html', {'error': "Invalid Username or Password."})
+
+    return render(request, 'core/login.html')
 
 # 3. NEW HELPER: Redirect already logged-in users
 def login_redirect_view(request):
