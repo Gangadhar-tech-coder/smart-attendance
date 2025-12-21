@@ -2,6 +2,9 @@ from django.contrib import admin
 from django.urls import path
 from django.conf import settings
 from django.conf.urls.static import static
+from core.views import home_stats_api
+from core.views import current_user_api
+
 from core.views import (
     HomeView,              # <--- New
     FacultyDashboardView, 
@@ -14,7 +17,7 @@ from core.views import (
 )
 urlpatterns = [
     # 1. The Public Home Page (Root URL)
-    path('', HomeView.as_view(), name='home'),
+    path('', login_view, name='home'),
 
     # 2. The Role-Based Dashboards (Separated)
     path('faculty/', FacultyDashboardView.as_view(), name='faculty_dashboard'), # Moved to /faculty/
@@ -29,6 +32,8 @@ urlpatterns = [
     # 4. Admin & API
     path('admin/', admin.site.urls),
     path('api/mark-attendance/', MarkAttendanceView.as_view(), name='mark-attendance'),
+    path('api/home-stats/', home_stats_api, name='home-stats'),
+    path('api/current-user/', current_user_api, name='current-user'),
 ]
 
 if settings.DEBUG:

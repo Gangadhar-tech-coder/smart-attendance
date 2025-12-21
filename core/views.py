@@ -13,19 +13,13 @@ from .models import User
 from django.db.models import Count
 import base64
 from django.core.files.base import ContentFile
-class HomeView(APIView):
-    def get(self, request):
-        # Fetch counts for the graphs
-        student_count = User.objects.filter(role='STUDENT').count()
-        faculty_count = User.objects.filter(role='FACULTY').count()
-        admin_count = User.objects.filter(role='ADMIN').count()
-        
-        context = {
-            'student_count': student_count,
-            'faculty_count': faculty_count,
-            'admin_count': admin_count
-        }
-        return render(request, 'core/home.html', context)
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from django.views.generic import TemplateView
+from django.http import JsonResponse
+class HomeView(TemplateView):
+    template_name = 'core/home.html'
+
 from datetime import timedelta # Import this at top
 # ...
 
@@ -34,83 +28,120 @@ from datetime import timedelta
 from django.utils import timezone
 from .utils import check_face_match, is_within_radius # Ensure this is imported
 
-# core/views.py
-
+@method_decorator(csrf_exempt, name='dispatch')
 class MarkAttendanceView(APIView):
     def post(self, request):
-        # 1. Get Data Manually (Since we aren't using serializer to save yet)
-        session_id = request.data.get('session')
-        gps_lat = float(request.data.get('gps_lat'))
-        gps_long = float(request.data.get('gps_long'))
-        live_image = request.FILES.get('captured_image') # The file in RAM
-        student = request.user
+        serializer = AttendanceSerializer(data=request.data)
+        if serializer.is_valid():
+            student = request.user
+            session_id = request.data.get('session')
 
-        # 0. BASIC CHECKS
-        if not live_image:
-            return Response({"error": "No image uploaded!"}, status=400)
-        
-        if not student.reference_image:
-             return Response({"error": "Security Scan missing! Please re-register."}, status=400)
+            # 0. BASIC VALIDATION (Before saving anything)
+            if not student.profile_image:
+                 return Response({"error": "You don't have a profile photo set!"}, status=400)
+            
+            session = None
+            # If session id provided, prefer it
+            if session_id:
+                try:
+                    session = AttendanceSession.objects.get(id=session_id)
+                except AttendanceSession.DoesNotExist:
+                    return Response({"error": "Session ID does not exist"}, status=400)
+            else:
+                # Fallback: pick first active session
+                for s in AttendanceSession.objects.all():
+                    if s.is_active:
+                        session = s
+                        break
+                if not session:
+                    return Response({"error": "No active attendance session found"}, status=400)
 
-        try:
-            session = AttendanceSession.objects.get(id=session_id)
-        except AttendanceSession.DoesNotExist:
-            return Response({"error": "Session ID invalid"}, status=400)
+            # ---------------------------------------------------------
+            # 1. SAVE RECORD TEMPORARILY
+            # (We must save it to disk first so the AI library can read the file path)
+            # ---------------------------------------------------------
+            record = serializer.save(student=student)
 
-        # ---------------------------------------------------------
-        # 1. PRIORITY CHECK: FACE RECOGNITION (In Memory) 👁️
-        # ---------------------------------------------------------
-        print("🤖 Verifying Face in Memory (No Save)...")
-        
-        # We pass the 'live_image' file object directly to utils
-        is_match = check_face_match(student.reference_image.path, live_image)
-        
-        if not is_match:
-            return Response({"error": "Face mismatch! Identity verification failed."}, status=400)
+            # ---------------------------------------------------------
+            # 2. PRIORITY CHECK: FACE RECOGNITION 👁️
+            # ---------------------------------------------------------
+            # Prefer using the profile image as the persistent reference (uploaded at signup)
+            print("🤖 Starting AI Face Check against profile image...")
+            ref_path = None
+            if student.profile_image:
+                try:
+                    ref_path = student.profile_image.path
+                except Exception:
+                    ref_path = None
 
-        # ---------------------------------------------------------
-        # 2. DURATION CHECK ⏳
-        # ---------------------------------------------------------
-        if not session.is_active:
-            return Response({"error": "Time is up! Class has ended."}, status=400)
+            if not ref_path and student.reference_image:
+                try:
+                    ref_path = student.reference_image.path
+                except Exception:
+                    ref_path = None
 
-        # ---------------------------------------------------------
-        # 3. 1-HOUR COOLDOWN CHECK 🕐
-        # ---------------------------------------------------------
-        last_record = AttendanceRecord.objects.filter(student=student).order_by('-timestamp').first()
-        if last_record:
-            time_since_last = timezone.now() - last_record.timestamp
-            if time_since_last < timedelta(hours=1):
-                wait_time = 60 - int(time_since_last.total_seconds() / 60)
-                return Response({"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, status=400)
+            if not ref_path:
+                record.delete()
+                return Response({"error": "No reference image available for this account."}, status=400)
 
-        # ---------------------------------------------------------
-        # 4. LOCATION CHECK 📍
-        # ---------------------------------------------------------
-        student_loc = (gps_lat, gps_long)
-        college_loc = (session.latitude, session.longitude)
-        
-        if not is_within_radius(student_loc, college_loc, session.radius_meters):
-             return Response({"error": "You are outside the class radius!"}, status=400)
+            is_match = check_face_match(ref_path, record.captured_image.path)
+            if not is_match:
+                record.delete()
+                return Response({"error": "Face not recognized. Keep your face clearly in frame."}, status=400)
 
-        # ---------------------------------------------------------
-        # 5. SUCCESS: CREATE RECORD (Without Image) ✅
-        # ---------------------------------------------------------
-        AttendanceRecord.objects.create(
-            session=session,
-            student=student,
-            gps_lat=gps_lat,
-            gps_long=gps_long,
-            status="PRESENT",
-            captured_image=None  # Explicitly saving NO image
-        )
+            # ---------------------------------------------------------
+            # 3. SECOND CHECK: CLASS DURATION ⏳
+            # ---------------------------------------------------------
+            if not session.is_active:
+                record.delete() # ❌ Delete logic
+                return Response({"error": "Time is up! Class has ended."}, status=400)
 
-        return Response({
-            "message": "Attendance Marked!",
-            "class_name": session.course.name,
-            "faculty_name": session.course.faculty.username,
-            "topic": session.topic
-        }, status=201)
+            # ---------------------------------------------------------
+            # 4. THIRD CHECK: 1-HOUR COOLDOWN 🕐
+            # ---------------------------------------------------------
+            # We verify the *previous* record (excluding the one we just saved)
+            last_record = AttendanceRecord.objects.filter(student=student).exclude(id=record.id).order_by('-timestamp').first()
+            
+            if last_record:
+                time_since_last = timezone.now() - last_record.timestamp
+                if time_since_last < timedelta(hours=1):
+                    wait_time = 60 - int(time_since_last.total_seconds() / 60)
+                    record.delete() # ❌ Delete logic
+                    return Response(
+                        {"error": f"You marked attendance recently. Please wait {wait_time} minutes."}, 
+                        status=400
+                    )
+
+            # ---------------------------------------------------------
+            # 5. FINAL CHECK: LOCATION (GPS) 📍
+            # ---------------------------------------------------------
+            student_loc = (float(request.data.get('gps_lat')), float(request.data.get('gps_long')))
+            college_loc = (session.latitude, session.longitude)
+            # ... inside post method ...
+
+            # ---------------------------------------------------------
+            # 4. FACE CHECK LOGIC (Updated)
+            # ---------------------------------------------------------
+            
+              # Location check
+              if not is_within_radius(student_loc, college_loc, session.radius_meters):
+                  record.delete()
+                  return Response({"error": "Out of range"}, status=400)
+
+            # ---------------------------------------------------------
+            # 6. SUCCESS: FINALIZE RECORD ✅
+            # ---------------------------------------------------------
+            record.status = "PRESENT"
+            record.save()
+
+            return Response({
+                "message": "Attendance Marked!",
+                "class_name": session.course.name,
+                "faculty_name": session.course.faculty.username,
+                "topic": session.topic
+            }, status=201)
+
+        return Response(serializer.errors, status=400)
 
 
 # core/views.py
@@ -225,15 +256,29 @@ def signup_view(request):
         try:
             user = User.objects.create_user(username=username, password=password)
             user.role = role
-            
+
+            # Save names and department if provided
+            first_name = request.POST.get('first_name') or request.POST.get('firstName')
+            last_name = request.POST.get('last_name') or request.POST.get('lastName')
+            dept = request.POST.get('department')
+            if first_name:
+                user.first_name = first_name
+            if last_name:
+                user.last_name = last_name
+            if dept:
+                try:
+                    user.department = dept
+                except Exception:
+                    pass
+
             # A. Save Display Photo
             user.profile_image = photo_file
-            
+
             # B. Save Security Reference (Convert Base64)
             format, imgstr = live_image_data.split(';base64,') 
             ext = format.split('/')[-1]
             file_data = ContentFile(base64.b64decode(imgstr), name=f'{username}_security_ref.{ext}')
-            
+
             user.reference_image = file_data # <--- SAVED TO NEW FIELD
 
             user.save()
@@ -247,43 +292,27 @@ def signup_view(request):
             return render(request, 'core/signup.html', {'error': str(e)})
 
     return render(request, 'core/signup.html')
-# core/views.py
-
 def login_view(request):
     if request.method == 'POST':
-        # 1. Get Data from Form
-        u_name = request.POST.get('username')
-        pass_word = request.POST.get('password')
-        selected_role = request.POST.get('role') # <--- Get the dropdown value
-
-        # 2. Standard Django Authentication
-        user = authenticate(username=u_name, password=pass_word)
-
-        if user is not None:
-            # 3. CUSTOM CONDITION: Check Role Match
-            # We compare the role in Database (user.role) vs Dropdown (selected_role)
-            if user.role != selected_role:
-                # Mismatch! Deny access.
-                return render(request, 'core/login.html', {
-                    'error': f"Access Denied: You are not registered as a {selected_role.capitalize()}."
-                })
-
-            # 4. Success - Log them in
+        form = AuthenticationForm(request, data=request.POST)
+        if form.is_valid():
+            user = form.get_user()
             login(request, user)
-
-            # 5. Redirect based on role
+            
+            # --- THE CONSTRAINT LOGIC ---
             if user.role == 'STUDENT':
                 return redirect('student_portal')
             elif user.role == 'FACULTY':
                 return redirect('faculty_dashboard')
-            elif user.role == 'ADMIN':
-                return redirect('/admin/')
-            
-        else:
-            # Authentication failed (Wrong Username/Password)
-            return render(request, 'core/login.html', {'error': "Invalid Username or Password."})
-
-    return render(request, 'core/login.html')
+            elif user.role == 'ADMIN' or user.is_superuser:
+                return redirect('/admin/') # Send Admins to Django Admin Panel
+            else:
+                return redirect('home') # Fallback
+            # ---------------------------
+    else:
+        form = AuthenticationForm()
+    
+    return render(request, 'core/login.html', {'form': form})
 
 # 3. NEW HELPER: Redirect already logged-in users
 def login_redirect_view(request):
@@ -304,3 +333,39 @@ def login_redirect_view(request):
 def logout_view(request):
     logout(request)
     return redirect('login')
+from django.http import JsonResponse
+
+def home_stats_api(request):
+    students = User.objects.filter(role='STUDENT').count()
+    faculty = User.objects.filter(role='FACULTY').count()
+    admins = User.objects.filter(role='ADMIN').count()
+
+    return JsonResponse({
+        "students": students,
+        "faculty": faculty,
+        "admins": admins,
+        "days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+        "attendance": [12, 18, 15, 22, 19]  # dummy for now
+    })
+
+
+def current_user_api(request):
+    """Return minimal JSON for the currently authenticated user."""
+    user = request.user
+    if not user or not user.is_authenticated:
+        return JsonResponse({'error': 'Unauthenticated'}, status=401)
+
+    profile_url = None
+    try:
+        if user.profile_image:
+            profile_url = user.profile_image.url
+    except Exception:
+        profile_url = None
+
+    return JsonResponse({
+        'username': user.username,
+        'name': user.get_full_name() or user.username,
+        'role': user.role,
+        'email': user.email,
+        'profile_image': profile_url
+    })

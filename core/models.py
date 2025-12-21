@@ -14,6 +14,9 @@ class User(AbstractUser):
     
     # Visual ID (Uploaded by user)
     profile_image = models.ImageField(upload_to='profiles/', blank=True, null=True)
+
+    # Department (AIML, CSE, ECE, DS, MECH)
+    department = models.CharField(max_length=50, blank=True, null=True)
     
     # Security Face (Live captured) - NEW FIELD
     reference_image = models.ImageField(upload_to='security_references/', blank=True, null=True)
